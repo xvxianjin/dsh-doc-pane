@@ -1,6 +1,18 @@
 # dsh-doc-pane
 
+![dsh-doc-pane 文档面板](docs/screenshot.png)
+
 在 DSH Web GUI 的右栏里打开、直接编辑当前会话正在改的 Markdown 文档。选中文字交给模型，它判断是改写还是回答：改写直接落进文档并高亮成待确认，点一下高亮可以接受、撤销或就此提意见。每次请求都带上这个会话里已经聊过的内容作为背景。
+
+## 安装
+
+需要 DeepSeek Harness（DSH）桌面端。
+
+1. 把本目录放到任意位置。
+2. 在 DSH 里用 `plugin_manager` 安装：`install_bundle`，target 指向本目录。
+3. 重启 DSH，会话标题栏出现「文档」按钮。
+
+手动安装：把 `cordis.patch.yml` 的条目合并进 profile 的 Cordis 配置，并在 profile `package.json` 的 `dependencies` 里加 `"@local/dsh-doc-pane": "link:<本目录>"`。
 
 ## 用法
 
@@ -79,3 +91,7 @@ node build.mjs --test # 顺便跑 jsdom 冒烟测试
 插件重新装回：`plugin_manager install_bundle` 指向本目录。Host half 的路由注册整段包在 try/catch 里，注册失败只会少一个接口，不会让激活失败。
 
 客户端半区别声明任何 `inject`：声明了服务又没就绪时，Cordis 会把条目停在 `loading`，而 Web 启动审计会把这种情况当成致命错误（`web boot: 1 entry did not activate`）。服务一律用 `ctx.get` 取，注册延后到服务出现时再做。
+
+## License
+
+MIT © 2026 Xianjin Xv，见 [LICENSE](LICENSE)。
