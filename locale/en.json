@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Document Pane",
+    "description": "Open the Markdown document the agent is working on in a side panel: edit it, preview it, and rewrite a selection with AI plus a word-level diff."
+  }
+}

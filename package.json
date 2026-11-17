@@ -1,0 +1,49 @@
+{
+  "name": "@local/dsh-doc-pane",
+  "version": "0.1.0",
+  "license": "MIT",
+  "author": "Xianjin Xv <1424177211@qq.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xvxianjin/dsh-doc-pane.git"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "markdown",
+    "editor",
+    "prosemirror",
+    "plugin"
+  ],
+  "type": "module",
+  "description": "Open the Markdown document the agent is editing in a side panel: edit it, preview it, and rewrite a selection with AI plus a word-level diff.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "recover-profile.cmd",
+    "recover-profile.ps1",
+    "vendor/editor.js"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  }
+}

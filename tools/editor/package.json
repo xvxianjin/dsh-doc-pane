@@ -1,0 +1,26 @@
+{
+  "name": "dsh-doc-pane-editor",
+  "private": true,
+  "type": "commonjs",
+  "description": "Build inputs for vendor/editor.js — the pane ships a prebuilt kernel, so this is only needed when changing it.",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node build.mjs --test"
+  },
+  "dependencies": {
+    "prosemirror-commands": "1.7.2",
+    "prosemirror-history": "1.5.1",
+    "prosemirror-inputrules": "1.5.1",
+    "prosemirror-keymap": "1.2.3",
+    "prosemirror-model": "1.25.12",
+    "prosemirror-schema-basic": "1.2.5",
+    "prosemirror-schema-list": "1.6.0",
+    "prosemirror-state": "1.4.4",
+    "prosemirror-tables": "1.8.5",
+    "prosemirror-view": "1.42.9",
+    "esbuild": "0.28.2"
+  },
+  "devDependencies": {
+    "jsdom": "30.1.3"
+  }
+}
