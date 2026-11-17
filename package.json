@@ -5,7 +5,7 @@
   "author": "Xianjin Xv <1424177211@qq.com>",
   "repository": {
     "type": "git",
-    "url": "https://github.com/xvxianjin/dsh-doc-pane.git"
+    "url": "git+https://github.com/xvxianjin/dsh-doc-pane.git"
   },
   "keywords": [
     "dsh",
