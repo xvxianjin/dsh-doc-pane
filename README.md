@@ -1,6 +1,6 @@
 # dsh-doc-pane
 
-![dsh-doc-pane 文档面板](docs/screenshot.png)
+[English](README.en.md) | 简体中文
 
 在 DSH Web GUI 的右栏里打开、直接编辑当前会话正在改的 Markdown 文档。选中文字交给模型，它判断是改写还是回答：改写直接落进文档并高亮成待确认，点一下高亮可以接受、撤销或就此提意见。每次请求都带上这个会话里已经聊过的内容作为背景。
 
@@ -8,11 +8,19 @@
 
 需要 DeepSeek Harness（DSH）桌面端。
 
-1. 把本目录放到任意位置。
-2. 在 DSH 里用 `plugin_manager` 安装：`install_bundle`，target 指向本目录。
-3. 重启 DSH，会话标题栏出现「文档」按钮。
+**从 npm 安装（推荐）**
 
-手动安装：把 `cordis.patch.yml` 的条目合并进 profile 的 Cordis 配置，并在 profile `package.json` 的 `dependencies` 里加 `"@local/dsh-doc-pane": "link:<本目录>"`。
+在 DSH 里用 `plugin_manager` 的 `install_bundle`，target 填 `dsh-doc-pane`，然后重启 DSH。
+
+**从源码安装**
+
+1. 克隆本仓库到任意位置。
+2. 用 `plugin_manager` 的 `install_bundle`，target 指向该目录。
+3. 重启 DSH。
+
+安装后，会话标题栏出现「文档」按钮。
+
+手动安装：把 `cordis.patch.yml` 的条目合并进 profile 的 Cordis 配置，并在 profile `package.json` 的 `dependencies` 里加 `"dsh-doc-pane": "^0.1.0"`（本地目录则用 `"link:<本目录>"`）。
 
 ## 用法
 
@@ -58,7 +66,7 @@
 
 ```yaml
 - id: dsh-doc-pane
-  name: '@local/dsh-doc-pane'
+  name: 'dsh-doc-pane'
   config:
     root: 'C:/path/to/notes'
 ```

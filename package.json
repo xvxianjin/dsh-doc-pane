@@ -1,5 +1,5 @@
 {
-  "name": "@local/dsh-doc-pane",
+  "name": "dsh-doc-pane",
   "version": "0.1.0",
   "license": "MIT",
   "author": "Xianjin Xv <1424177211@qq.com>",
@@ -29,10 +29,18 @@
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
+    "LICENSE",
     "README.md",
+    "README.en.md",
     "recover-profile.cmd",
     "recover-profile.ps1",
-    "vendor/editor.js"
+    "vendor/editor.js",
+    "tools/editor/build.mjs",
+    "tools/editor/editor.cjs",
+    "tools/editor/entry.js",
+    "tools/editor/smoke.cjs",
+    "tools/editor/package.json",
+    "tools/editor/package-lock.json"
   ],
   "dsh": {
     "bundle": {
