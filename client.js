@@ -1,5 +1,5 @@
 window.__ModuleLoader__.load({
-  id: '@local/dsh-doc-pane',
+  id: 'dsh-doc-pane',
   factory(require) {
     const React = require('react')
     const h = React.createElement
@@ -7,7 +7,7 @@ window.__ModuleLoader__.load({
     const API = '/dsh-doc-pane/api'
     // The right-column tab: the type id is also the slot key its body and
     // title register under, and the kind is what the header button opens.
-    const TAB_ID = '@local/dsh-doc-pane'
+    const TAB_ID = 'dsh-doc-pane'
     const TAB_KIND = 'doc-pane'
     // Which files this panel claims when a link in the chat is clicked.
     const TEXT_EXT = /\.(md|markdown|mdx|txt)$/i
