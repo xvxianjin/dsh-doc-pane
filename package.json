@@ -1,6 +1,6 @@
 {
   "name": "dsh-doc-pane",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "license": "MIT",
   "author": "Xianjin Xv <1424177211@qq.com>",
   "repository": {
@@ -17,9 +17,19 @@
   ],
   "type": "module",
   "description": "Open the Markdown document the agent is editing in a side panel: edit it, preview it, and rewrite a selection with AI plus a word-level diff.",
+  "scripts": {
+    "check": "node --check client.js && node --check index.js",
+    "test:unit": "node --test tests/*.test.mjs",
+    "test:editor": "npm --prefix tools/editor test",
+    "test": "npm run check && npm run test:unit && npm run test:editor"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
+    "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
@@ -32,15 +42,10 @@
     "LICENSE",
     "README.md",
     "README.en.md",
+    "CHANGELOG.md",
     "recover-profile.cmd",
     "recover-profile.ps1",
-    "vendor/editor.js",
-    "tools/editor/build.mjs",
-    "tools/editor/editor.cjs",
-    "tools/editor/entry.js",
-    "tools/editor/smoke.cjs",
-    "tools/editor/package.json",
-    "tools/editor/package-lock.json"
+    "vendor/editor.js"
   ],
   "dsh": {
     "bundle": {

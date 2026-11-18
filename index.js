@@ -12,6 +12,7 @@
  */
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import { createHash, randomUUID } from 'node:crypto'
 
 
 const API = '/dsh-doc-pane/api'
@@ -34,11 +35,69 @@ const SKIP_DIRS = new Set([
   '.venv', 'venv', 'target', '.cache', 'vendor',
 ])
 const TEXT_EXT = new Set(['.md', '.markdown', '.mdx', '.txt'])
-const MAX_BODY = 4 * 1024 * 1024
+const MAX_DOCUMENT = 4 * 1024 * 1024
+const MAX_BODY = MAX_DOCUMENT
+const MAX_SAVE_BODY = MAX_DOCUMENT * 6 + 64 * 1024 // JSON control-character escapes plus metadata
+const writes = new Map()
+const versionOf = (bytes) => createHash('sha256').update(bytes).digest('hex')
+const tooLarge = () => Object.assign(new Error('文档或请求超过大小上限（文档最多 4 MiB）'), { status: 413 })
+
+async function snapshot(file) {
+  const handle = await fs.open(file, 'r')
+  try {
+    const stat = await handle.stat()
+    if (!stat.isFile()) throw new Error('不是普通文档')
+    if (stat.size > MAX_DOCUMENT) throw tooLarge()
+    const bytes = Buffer.alloc(stat.size + 1)
+    let used = 0
+    while (used < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, used, bytes.length - used, used)
+      if (!bytesRead) break
+      used += bytesRead
+    }
+    const after = await handle.stat()
+    if (used !== stat.size || after.size !== used || after.ctimeMs !== stat.ctimeMs) throw new Error('读取期间文档已更改，请重试')
+    const data = bytes.subarray(0, used)
+    const content = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(data)
+    return { content, mtime: after.mtimeMs, version: versionOf(data) }
+  } finally { await handle.close() }
+}
+
+async function saveDocument(target, payload) {
+  if (typeof payload.content !== 'string') throw new Error('缺少文档内容')
+  if (Buffer.byteLength(payload.content) > MAX_DOCUMENT) throw tooLarge()
+  const file = await fs.realpath(target.absolute)
+  const key = process.platform === 'win32' ? file.toLowerCase() : file
+  const job = (writes.get(key) ?? Promise.resolve()).catch(() => {}).then(async () => {
+    await fs.access(file, fs.constants.W_OK)
+    const meta = await fs.stat(file)
+    if (meta.nlink > 1) throw new Error('为保留硬链接关系，此文档不支持原子保存')
+    const temp = path.join(path.dirname(file), `.dsh-doc-${randomUUID()}.tmp`)
+    const handle = await fs.open(temp, 'wx', 0o600)
+    try {
+      let mtime
+      try {
+        await handle.writeFile(payload.content, 'utf8')
+        await handle.chmod(meta.mode & 0o777)
+        await handle.sync()
+        mtime = (await handle.stat()).mtimeMs
+      } finally { await handle.close() }
+      const current = await snapshot(file)
+      if (payload.expectedVersion !== undefined ? current.version !== payload.expectedVersion :
+          payload.expectedMtime !== undefined && current.mtime !== payload.expectedMtime) {
+        return { status: 409, data: { conflict: true, ...current } }
+      }
+      await fs.rename(temp, file)
+      return { status: 200, data: { path: target.relative, mtime, version: versionOf(payload.content) } }
+    } finally { await fs.rm(temp, { force: true }) }
+  })
+  writes.set(key, job)
+  try { return await job } finally { if (writes.get(key) === job) writes.delete(key) }
+}
 
 const REWRITE_SYSTEM = [
   '你是文档编辑器里的改写引擎。用户给出文档中的一段原文和一条修改要求。',
-  '只输出改写后的这段文字：不要解释、不要加引号、不要用代码围栏包裹整段结果。',
+  '只输出一个完整 JSON 对象 {"kind":"edit","text":"替换文字"}，保留 text 首尾空白，删除时 text 为 ""。',
   '保留原文的 Markdown 标记、缩进和语言；除非要求明确改变结构或长度，尽量少改动无关的词。',
   '如果给了对话背景，让它影响用词、术语和详略，但不要复述背景。',
 ].join('\n')
@@ -77,73 +136,34 @@ const CHAT_SYSTEM = [
  * usable answer instead of an error.
  */
 function readJsonObject(raw) {
-  const start = raw.indexOf('{')
-  const end = raw.lastIndexOf('}')
-  if (start < 0 || end <= start) return null
-  try {
-    const value = JSON.parse(raw.slice(start, end + 1))
-    return value && typeof value === 'object' ? value : null
-  } catch {
-    return null
-  }
-}
-
-/**
- * A model that writes JSON by hand often breaks it with a raw newline inside the
- * string, so a strict parse fails and the whole object used to be shown to the
- * user as the answer. This reads the two fields out of the raw text instead.
- */
-function readLooseReply(raw) {
-  const kindMatch = /"kind"\s*:\s*"(edit|answer)"/.exec(raw)
-  const textStart = /"text"\s*:\s*"/.exec(raw)
-  if (!kindMatch || !textStart || textStart.index < kindMatch.index) return null
-  let index = textStart.index + textStart[0].length
-  let body = ''
-  while (index < raw.length) {
-    const char = raw[index]
-    if (char === '\\') {
-      body += raw.slice(index, index + 2)
-      index += 2
-      continue
-    }
-    if (char === '"') break
-    body += char
-    index += 1
-  }
-  let text = body
-  try {
-    text = JSON.parse(`"${body}"`)
-  } catch {
-    text = body.replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\\\/g, '\\')
-  }
-  // An empty text is meaningful for a deletion, so only answers require content.
-  if (!text.trim() && kindMatch[1] !== 'edit') return null
-  return { kind: kindMatch[1], text }
+  try { return JSON.parse(raw) } catch { return null }
 }
 
 function parseChatReply(raw, allowEdit) {
-  let value = readJsonObject(raw)
-  // Some models nest the JSON object inside the text field; unwrap a few levels.
-  for (let depth = 0; depth < 3 && value; depth += 1) {
-    const text = typeof value.text === 'string' ? value.text.trim() : ''
-    if (!text || !text.startsWith('{')) break
-    const inner = readJsonObject(text)
-    if (!inner || typeof inner.text !== 'string') break
-    value = inner
-  }
-  const text = typeof value?.text === 'string' ? value.text.trim() : ''
-  const deleting = value?.kind === 'edit' && allowEdit && typeof value?.text === 'string' && !text
-  if (text || deleting) {
-    const kind = value.kind === 'edit' && allowEdit ? 'edit' : 'answer'
-    return { kind, text }
-  }
-  const loose = readLooseReply(raw)
-  if (loose) {
-    const kind = loose.kind === 'edit' && allowEdit ? 'edit' : 'answer'
-    if (kind === 'answer' && !loose.text.trim()) return { kind: 'answer', text: '' }
-    return { kind, text: loose.text.trim() }
+  const value = readJsonObject(raw)
+  if (typeof value?.text === 'string') {
+    if (value.kind === 'edit' && allowEdit) return { kind: 'edit', text: value.text }
+    if (value.kind === 'answer' || value.kind === 'edit') return { kind: 'answer', text: value.text }
   }
   return { kind: 'answer', text: raw.trim() }
+}
+
+async function completedText(stream, signal) {
+  let text = ''
+  let stopped = false
+  for await (const chunk of stream) {
+    if (stopped) throw new Error('模型在结束后仍返回数据，请重试')
+    if (chunk.type === 'text-delta') text += chunk.text
+    if (chunk.type === 'finish') {
+      if (chunk.reason?.kind !== 'stop') {
+        throw new Error(`模型回复未完成：${chunk.reason?.failure?.message ?? chunk.reason?.kind ?? '未知原因'}`)
+      }
+      stopped = true
+    }
+  }
+  signal.throwIfAborted()
+  if (!stopped) throw new Error('模型回复未完整结束，请重试')
+  return text
 }
 
 /**
@@ -152,17 +172,13 @@ function parseChatReply(raw, allowEdit) {
  * through untouched.
  */
 function parseSkillRequest(raw) {
-  const start = raw.indexOf('{')
-  const end = raw.lastIndexOf('}')
-  if (start < 0 || end <= start) return []
-  try {
-    const value = JSON.parse(raw.slice(start, end + 1))
-    if (value?.kind !== 'skill') return []
-    const names = Array.isArray(value?.names) ? value.names : [value?.name]
-    return names.filter((item) => typeof item === 'string' && item.trim()).map((item) => item.trim())
-  } catch {
-    return []
-  }
+  const value = readJsonObject(raw)
+  if (value?.kind !== 'skill' || !Array.isArray(value.names)) return []
+  return normalizeSkillNames(value.names).slice(0, 2)
+}
+
+function normalizeSkillNames(names) {
+  return [...new Set((Array.isArray(names) ? names : []).filter(name => typeof name === 'string').map(name => name.trim()).filter(Boolean))].slice(0, 4)
 }
 
 /** Per-turn and total caps for the conversation background sent with a rewrite. */
@@ -208,15 +224,15 @@ function sendJson(response, status, value) {
   response.end(body)
 }
 
-function readJsonBody(request) {
+function readJsonBody(request, limit = MAX_BODY) {
   return new Promise((resolve, reject) => {
     let size = 0
     const chunks = []
     request.on('data', (chunk) => {
       size += chunk.length
-      if (size > MAX_BODY) {
-        reject(new Error('请求体过大'))
-        request.destroy()
+      if (size > limit) {
+        chunks.length = 0
+        reject(tooLarge())
         return
       }
       chunks.push(chunk)
@@ -245,7 +261,7 @@ async function routeParams(request, url) {
   const params = {}
   for (const [key, value] of url.searchParams) params[key] = value
   if (request.method === 'POST') {
-    const body = await readJsonBody(request).catch(() => ({}))
+    const body = await readJsonBody(request)
     if (body && typeof body === 'object') {
       for (const [key, value] of Object.entries(body)) {
         if (typeof value === 'string') params[key] = value
@@ -276,7 +292,6 @@ export function apply(ctx, config) {
     ? path.resolve(config.root.trim())
     : undefined
 
-  let cachedRoute
 
   // The newest live session, used only when the caller names none.
   function latestSessionId() {
@@ -436,33 +451,17 @@ export function apply(ctx, config) {
     return found.slice(0, 40)
   }
 
-  async function resolveRoute(llm) {
-    if (cachedRoute && cachedRoute.expires > Date.now()) return cachedRoute.route
+  function sessionAgent(sessionId) {
+    return sessionId ? ctx.get('agents')?.get(sessionId) : undefined
+  }
 
-    let route
-    const holder = ctx.get('agentDefaultModel')
-    const selection = holder && typeof holder.currentSelection === 'function'
-      ? holder.currentSelection()
-      : undefined
+  function selectedRoute(sessionId) {
+    return sessionAgent(sessionId)?.model.current() ?? ctx.get('agentDefaultModel')?.currentSelection()
+  }
 
-    const provider = pickString(selection?.provider, selection?.providerId, selection?.route?.provider)
-    const model = pickString(selection?.model, selection?.modelId, selection?.route?.model, selection?.modelName)
-    const reasoningEffort = pickString(selection?.reasoningEffort, selection?.reasoning, selection?.effort)
-    if (provider && model) route = { provider, model, reasoningEffort }
-
-    if (!route) {
-      const providers = await llm.listProviders()
-      for (const entry of providers) {
-        const models = await llm.listModels(entry.id)
-        if (models.length) {
-          route = { provider: entry.id, model: models[0].id }
-          break
-        }
-      }
-    }
-    if (!route) throw new Error('没有可用的模型：请先在设置里选择默认模型')
-
-    cachedRoute = { route, expires: Date.now() + 60_000 }
+  function resolveRoute(sessionId) {
+    const route = selectedRoute(sessionId)
+    if (!route) throw new Error('没有可用的模型：请先选择会话模型或默认模型')
     return route
   }
 
@@ -513,7 +512,7 @@ export function apply(ctx, config) {
     if (!ask && !instruction) throw new Error('请先写下改写要求')
     if (!selection.trim()) throw new Error(ask ? '请先选中要询问的文字' : '请先选中要改写的文字')
 
-    const route = await resolveRoute(llm)
+    const route = resolveRoute(payload?.session)
     const name = typeof payload?.name === 'string' && payload.name ? payload.name : '未命名文档'
     const before = typeof payload?.before === 'string' ? payload.before.slice(-1600) : ''
     const after = typeof payload?.after === 'string' ? payload.after.slice(0, 1600) : ''
@@ -540,7 +539,8 @@ export function apply(ctx, config) {
         ].join('\n')
 
     const controller = new AbortController()
-    if (signal) signal.addEventListener('abort', () => controller.abort(), { once: true })
+    if (signal?.aborted) controller.abort()
+    else signal?.addEventListener('abort', () => controller.abort(), { once: true })
     const timer = setTimeout(() => controller.abort(), 150_000)
 
     let text = ''
@@ -554,23 +554,15 @@ export function apply(ctx, config) {
         maxTokens: ask ? 2000 : 4000,
         signal: controller.signal,
       })
-      for await (const chunk of stream) {
-        if (chunk?.type === 'text-delta') text += chunk.text
-        else if (chunk?.type === 'finish') {
-          const kind = chunk.reason?.kind
-          if (kind === 'error' || kind === 'aborted') {
-            const detail = chunk.reason?.failure?.message ?? kind
-            throw new Error(`模型调用失败：${detail}`)
-          }
-        }
-      }
+      text = await completedText(stream, controller.signal)
     } finally {
       clearTimeout(timer)
     }
 
-    const cleaned = cleanModelText(text)
-    if (!cleaned) throw new Error('模型没有返回内容')
-    return { text: cleaned, provider: route.provider, model: route.model, mode: ask ? 'ask' : 'rewrite' }
+    const reply = parseChatReply(cleanModelText(text), !ask)
+    if (!ask && reply.kind !== 'edit') throw new Error('改写结果格式不完整，请重试')
+    if (ask && !reply.text.trim()) throw new Error('模型没有返回内容')
+    return { text: reply.text, provider: route.provider, model: route.model, mode: ask ? 'ask' : 'rewrite' }
   }
 
   /**
@@ -579,7 +571,7 @@ export function apply(ctx, config) {
    * answers with `{ kind, text }`. A quote is required for an edit.
    */
   /** Providers and their models, for the composer's model picker. */
-  async function listModelOptions() {
+  async function listModelOptions(sessionId) {
     const llm = ctx.get('llm')
     if (!llm) throw new Error('当前部署没有 llm 服务')
     const providers = await llm.listProviders()
@@ -600,109 +592,34 @@ export function apply(ctx, config) {
           .map((model) => ({ id: String(model.id), name: pickString(model.name, model.id) })),
       })
     }
-    let current = null
-    const holder = ctx.get('agentDefaultModel')
-    const selection = holder && typeof holder.currentSelection === 'function' ? holder.currentSelection() : undefined
-    const provider = pickString(selection?.provider, selection?.providerId, selection?.route?.provider)
-    const model = pickString(selection?.model, selection?.modelId, selection?.route?.model, selection?.modelName)
-    if (provider && model) current = { provider, model }
-    return { providers: out, current }
+    return { providers: out, current: selectedRoute(sessionId) ?? null }
   }
 
-  /** The skill catalog, for the composer's skill picker. */
-  async function listSkillOptions() {
+  async function skillView(sessionId, signal) {
+    const scope = sessionAgent(sessionId)
+    const cwd = scope ? await ctx.get('workingDirectory').ensure(scope, signal) : undefined
+    const lookup = { scope, cwd, signal }
     const registry = ctx.get('skills')
-    if (!registry || typeof registry.list !== 'function') return { skills: [] }
-    const list = await registry.list()
-    return {
-      skills: (Array.isArray(list) ? list : [])
-        .map((item) => ({
-          name: pickString(item?.name, item?.id) ?? '',
-          description: pickString(item?.description, item?.summary) ?? '',
-        }))
-        .filter((item) => item.name),
-    }
+    const entries = await registry?.list(lookup) ?? []
+    return { registry, lookup, entries }
   }
 
-  /** A skill's instructions as text, whatever field the definition keeps them in. */
-  async function readSkill(name) {
-    const registry = ctx.get('skills')
-    if (!registry || typeof registry.get !== 'function') return ''
-    let definition
-    try {
-      definition = await registry.get(name)
-    } catch (error) {
-      console.error('dsh-doc-pane: skill lookup failed', name, error)
-      return ''
-    }
-    if (!definition) return ''
-    for (const key of ['content', 'instructions', 'body', 'text', 'markdown', 'prompt']) {
-      const value = definition[key]
-      if (typeof value === 'string' && value.trim()) return value
-    }
-    const file = pickString(definition.path, definition.file, definition.filePath)
-    if (file) {
-      try {
-        const target = await ctx.fs.resolve(file)
-        const text = await ctx.fs.readText(target)
-        if (typeof text === 'string' && text.trim()) return text
-      } catch (error) {
-        console.error('dsh-doc-pane: skill file read failed', file, error)
+  async function listSkillOptions(sessionId) {
+    const { entries } = await skillView(sessionId)
+    return { skills: entries.filter(item => item.invocation.userInvocable).map(({ name, description }) => ({ name, description })) }
+  }
+
+  async function loadSkills(view, names, policy) {
+    const loaded = []
+    for (const name of names) {
+      if (!view.entries.some(item => item.name === name && item.invocation[policy])) {
+        throw new Error(`当前无法调用技能 ${name}`)
       }
+      const skill = await view.registry.get(name, view.lookup)
+      if (!skill?.invocation[policy] || typeof skill.content !== 'string') throw new Error(`当前无法调用技能 ${name}`)
+      loaded.push(`【技能 ${name}】\n${skill.content}`)
     }
-    return pickString(definition.description, definition.summary) ?? ''
-  }
-
-  /** Name + one-line description of every skill, so the model can ask for one. */
-  async function skillCatalog() {
-    const { skills } = await listSkillOptions()
-    const lines = []
-    for (const item of skills) {
-      const description = item.description.replace(/\s+/g, ' ').slice(0, 180)
-      lines.push(description ? `- ${item.name}：${description}` : `- ${item.name}`)
-    }
-    return lines.join('\n').slice(0, 2400)
-  }
-
-  /** Deduplicated, capped name list out of whatever the client sent. */
-  function normalizeSkills(names) {
-    const out = []
-    for (const item of Array.isArray(names) ? names : []) {
-      const name = typeof item === 'string' ? item.trim() : ''
-      if (name && !out.includes(name)) out.push(name)
-      if (out.length >= 4) break
-    }
-    return out
-  }
-
-  /**
-   * The system prompt, the skill catalog, and the full text of the skills that
-   * are in play. The catalog is always sent: in the centre chat the agent sees
-   * it and picks skills on its own, and this panel copies that behaviour by
-   * letting the model ask for the full instructions.
-   */
-  async function composeSystem(names, options = {}) {
-    const picked = normalizeSkills(names)
-    const chunks = []
-    for (const name of picked) {
-      const body = await readSkill(name)
-      if (body) chunks.push(`【技能 ${name}】\n${body.slice(0, 6000)}`)
-    }
-    const lines = [CHAT_SYSTEM]
-    if (options.catalog !== false) {
-      const catalog = await skillCatalog()
-      if (catalog) lines.push('', '【可用技能目录】', catalog)
-    }
-    if (chunks.length) {
-      lines.push(
-        '',
-        '下面这些技能的完整说明已经加载。按技能的步骤、术语和风格处理这次请求，',
-        '但输出格式不变：仍然只能是一个 {kind, text} 的 JSON 对象。',
-        '',
-        chunks.join('\n\n'),
-      )
-    }
-    return lines.join('\n')
+    return loaded
   }
 
   async function chat(payload, signal) {
@@ -726,7 +643,7 @@ export function apply(ctx, config) {
           reasoningEffort: pickString(payload?.reasoningEffort),
         }
       : null
-    const route = picked ?? (await resolveRoute(llm))
+    const route = picked ?? (resolveRoute(payload?.session))
     const context = await readConversation(payload?.session)
 
     const parts = [`文档：${name}`]
@@ -748,15 +665,15 @@ export function apply(ctx, config) {
     }
     parts.push('\n【用户这次说】', prompt)
 
-    const pickedSkills = normalizeSkills(payload?.skills)
+    const pickedSkills = normalizeSkillNames(payload?.skills)
 
     const controller = new AbortController()
-    if (signal) signal.addEventListener('abort', () => controller.abort(), { once: true })
+    if (signal?.aborted) controller.abort()
+    else signal?.addEventListener('abort', () => controller.abort(), { once: true })
     const timer = setTimeout(() => controller.abort(), 150_000)
 
     /** One model call; returns the raw text. */
     const ask = async (system) => {
-      let text = ''
       const stream = llm.stream({
         provider: route.provider,
         model: route.model,
@@ -766,27 +683,22 @@ export function apply(ctx, config) {
         maxTokens: 4000,
         signal: controller.signal,
       })
-      for await (const chunk of stream) {
-        if (chunk?.type === 'text-delta') text += chunk.text
-        else if (chunk?.type === 'finish') {
-          const kind = chunk.reason?.kind
-          if (kind === 'error' || kind === 'aborted') {
-            const detail = chunk.reason?.failure?.message ?? kind
-            throw new Error(`模型调用失败：${detail}`)
-          }
-        }
-      }
-      return cleanModelText(text)
+      return cleanModelText(await completedText(stream, controller.signal))
     }
 
     let usedSkills = pickedSkills
     let cleaned = ''
     try {
-      cleaned = await ask(await composeSystem(pickedSkills, { catalog: true }))
-      const wanted = parseSkillRequest(cleaned).filter((name) => !usedSkills.includes(name)).slice(0, 2)
+      const view = await skillView(payload?.session, controller.signal)
+      const loaded = await loadSkills(view, pickedSkills, 'userInvocable')
+      const catalog = view.entries.filter(item => item.invocation.modelInvocable)
+        .map(item => `- ${item.name}：${item.description}`).join('\n')
+      cleaned = await ask([CHAT_SYSTEM, catalog && `【可用技能目录】\n${catalog}`, ...loaded].filter(Boolean).join('\n\n'))
+      const wanted = parseSkillRequest(cleaned).filter(name => !usedSkills.includes(name))
       if (wanted.length) {
-        usedSkills = normalizeSkills([...usedSkills, ...wanted])
-        cleaned = await ask(await composeSystem(usedSkills, { catalog: true }))
+        const extra = await loadSkills(view, wanted, 'modelInvocable')
+        usedSkills = [...usedSkills, ...wanted]
+        cleaned = await ask([CHAT_SYSTEM, ...loaded, ...extra, '请直接给出最终回答或改写。'].join('\n\n'))
       }
     } finally {
       clearTimeout(timer)
@@ -855,7 +767,7 @@ export function apply(ctx, config) {
                   name: path.basename(target.absolute),
                 })
               } catch (error) {
-                sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) })
+                sendJson(response, error?.status === 413 ? 413 : 400, { error: error instanceof Error ? error.message : String(error) })
               }
             },
           }),
@@ -874,7 +786,7 @@ export function apply(ctx, config) {
                 const files = await scanRecent(root)
                 sendJson(response, 200, { root, files })
               } catch (error) {
-                sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) })
+                sendJson(response, error?.status === 413 ? 413 : 500, { error: error instanceof Error ? error.message : String(error) })
               }
             },
           }),
@@ -886,13 +798,9 @@ export function apply(ctx, config) {
                 const url = new URL(request.url ?? '/', 'http://localhost')
                 const params = await routeParams(request, url)
                 const target = await resolveInside(params.path, params.session || undefined)
-                const [content, stat] = await Promise.all([
-                  fs.readFile(target.absolute, 'utf8'),
-                  fs.stat(target.absolute),
-                ])
-                sendJson(response, 200, { path: target.relative, content, mtime: stat.mtimeMs })
+                sendJson(response, 200, { path: target.relative, ...await snapshot(target.absolute) })
               } catch (error) {
-                sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) })
+                sendJson(response, error?.status === 413 ? 413 : 400, { error: error instanceof Error ? error.message : String(error) })
               }
             },
           }),
@@ -906,23 +814,12 @@ export function apply(ctx, config) {
                 return
               }
               try {
-                const payload = await readJsonBody(request)
+                const payload = await readJsonBody(request, MAX_SAVE_BODY)
                 const target = await resolveInside(payload.path, typeof payload.session === 'string' ? payload.session : undefined)
-                const content = typeof payload.content === 'string' ? payload.content : ''
-                const expected = typeof payload.expectedMtime === 'number' ? payload.expectedMtime : undefined
-                if (expected !== undefined) {
-                  const current = await fs.stat(target.absolute).catch(() => undefined)
-                  if (current && Math.abs(current.mtimeMs - expected) > 1) {
-                    const latest = await fs.readFile(target.absolute, 'utf8').catch(() => '')
-                    sendJson(response, 409, { conflict: true, content: latest, mtime: current.mtimeMs })
-                    return
-                  }
-                }
-                await fs.writeFile(target.absolute, content, 'utf8')
-                const stat = await fs.stat(target.absolute)
-                sendJson(response, 200, { path: target.relative, mtime: stat.mtimeMs })
+                const { status, data } = await saveDocument(target, payload)
+                sendJson(response, status, data)
               } catch (error) {
-                sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) })
+                sendJson(response, error?.status === 413 ? 413 : 400, { error: error instanceof Error ? error.message : String(error) })
               }
             },
           }),
@@ -936,13 +833,13 @@ export function apply(ctx, config) {
                 return
               }
               const controller = new AbortController()
-              request.on('close', () => controller.abort())
+              response.on('close', () => controller.abort())
               try {
                 const payload = await readJsonBody(request)
                 const result = await rewrite(payload, controller.signal)
                 sendJson(response, 200, result)
               } catch (error) {
-                sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) })
+                sendJson(response, error?.status === 413 ? 413 : 400, { error: error instanceof Error ? error.message : String(error) })
               }
             },
           }),
@@ -956,9 +853,10 @@ export function apply(ctx, config) {
                 return
               }
               try {
-                sendJson(response, 200, await listModelOptions())
+                const params = await routeParams(request, new URL(request.url ?? '/', 'http://localhost'))
+                sendJson(response, 200, await listModelOptions(params.session))
               } catch (error) {
-                sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) })
+                sendJson(response, error?.status === 413 ? 413 : 400, { error: error instanceof Error ? error.message : String(error) })
               }
             },
           }),
@@ -972,9 +870,10 @@ export function apply(ctx, config) {
                 return
               }
               try {
-                sendJson(response, 200, await listSkillOptions())
+                const params = await routeParams(request, new URL(request.url ?? '/', 'http://localhost'))
+                sendJson(response, 200, await listSkillOptions(params.session))
               } catch (error) {
-                sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) })
+                sendJson(response, error?.status === 413 ? 413 : 400, { error: error instanceof Error ? error.message : String(error) })
               }
             },
           }),
@@ -988,13 +887,13 @@ export function apply(ctx, config) {
                 return
               }
               const controller = new AbortController()
-              request.on('close', () => controller.abort())
+              response.on('close', () => controller.abort())
               try {
                 const payload = await readJsonBody(request)
                 const result = await chat(payload, controller.signal)
                 sendJson(response, 200, result)
               } catch (error) {
-                sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) })
+                sendJson(response, error?.status === 413 ? 413 : 400, { error: error instanceof Error ? error.message : String(error) })
               }
             },
           }),

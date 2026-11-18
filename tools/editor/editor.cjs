@@ -16697,6 +16697,31 @@ function parseHtml(html) {
   holder.innerHTML = html || "";
   return DOMDocParser.fromSchema(schema).parse(holder);
 }
+function codeBlockView(node) {
+  const dom = document.createElement("pre");
+  const contentDOM = document.createElement("code");
+  dom.appendChild(contentDOM);
+  const paint = (current) => {
+    const language = current.attrs.params || "";
+    dom.className = "dsp-code dsp-code-pre";
+    dom.setAttribute("data-lang", language);
+    contentDOM.className = language ? "language-" + language : "";
+  };
+  paint(node);
+  return {
+    dom,
+    contentDOM,
+    ignoreMutation(mutation) {
+      return mutation.type === "attributes" && mutation.attributeName === "data-dsh-responsive-part";
+    },
+    update(next) {
+      if (next.type !== node.type) return false;
+      node = next;
+      paint(next);
+      return true;
+    }
+  };
+}
 function create(options) {
   const root = options && options.root;
   if (!root) throw new Error("DshDocEditor: root is required");
@@ -16709,6 +16734,7 @@ function create(options) {
   });
   const view = new EditorView(root, {
     state,
+    nodeViews: { code_block: codeBlockView },
     attributes: {
       class: "dsp-pm",
       spellcheck: "false",
@@ -16717,9 +16743,8 @@ function create(options) {
     dispatchTransaction(transaction) {
       const next = view.state.apply(transaction);
       view.updateState(next);
-      if (!transaction.docChanged) return;
-      onSelectionChange();
-      if (onChange && !muted) onChange();
+      if (transaction.docChanged || transaction.selectionSet) onSelectionChange();
+      if (transaction.docChanged && onChange && !muted) onChange();
     },
     handleDOMEvents: {
       mousedown: (view2, event) => {
@@ -16733,10 +16758,12 @@ function create(options) {
         view2.dispatch(view2.state.tr.setNodeMarkup(item.pos, null, { ...item.node.attrs, task: next }));
         return true;
       },
-      mouseup: (view2, event) => {
+      mouseup: (view2) => {
         onSelectionChange();
         if (typeof window !== "undefined" && typeof window.setTimeout === "function") {
-          window.setTimeout(() => syncFromDom(view2, event), 0);
+          window.setTimeout(() => {
+            if (!view2.isDestroyed) syncFromDom(view2);
+          }, 0);
         }
         return false;
       },
@@ -16746,7 +16773,7 @@ function create(options) {
       }
     }
   });
-  function syncFromDom(view2, event) {
+  function syncFromDom(view2) {
     const picked = typeof window !== "undefined" && window.getSelection ? window.getSelection() : null;
     if (!picked || !picked.rangeCount) return;
     const anchor = picked.anchorNode;
@@ -16767,18 +16794,13 @@ function create(options) {
       const firstCell = cellPosAt(view2.state.doc, a);
       const lastCell = cellPosAt(view2.state.doc, b);
       if (firstCell >= 0 && lastCell >= 0 && firstCell !== lastCell) return;
-      const current2 = view2.state.selection;
-      if (current2.from !== a || current2.to !== b || current2 instanceof CellSelection) {
-        commitSelection(TextSelection.create(view2.state.doc, a, b));
+      const current = view2.state.selection;
+      if (current.from !== a || current.to !== b || current instanceof CellSelection) {
+        try {
+          view2.dispatch(view2.state.tr.setSelection(TextSelection.create(view2.state.doc, a, b)));
+        } catch (error) {
+        }
       }
-      return;
-    }
-    const hit = typeof view2.posAtCoords === "function" ? view2.posAtCoords({ left: event.clientX, top: event.clientY }) : null;
-    if (!hit || typeof hit.pos !== "number") return;
-    const caret = Math.min(Math.max(hit.pos, 0), size);
-    const current = view2.state.selection;
-    if (current instanceof CellSelection || current.from !== caret || current.to !== caret) {
-      commitSelection(TextSelection.near(view2.state.doc.resolve(caret)));
     }
   }
   function selectionRect(from, to) {

@@ -4,6 +4,7 @@ tools/editor/node_modules/
 
 # local scratch (temporary files, must stay out of the repo)
 .工作区/
+过程记录/
 *.log
 npm-debug.log*
 
