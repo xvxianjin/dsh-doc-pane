@@ -13,6 +13,7 @@ global.getSelection = window.getSelection.bind(window)
 global.MutationObserver = window.MutationObserver
 global.DOMParser = window.DOMParser
 global.HTMLElement = window.HTMLElement
+global.getComputedStyle = window.getComputedStyle.bind(window)
 // jsdom has no layout: text nodes and ranges have no client rects, which the
 // view asks for when it scrolls the caret into view.
 const noRects = () => []
@@ -34,6 +35,54 @@ if (!global.ClipboardEvent) {
 }
 
 const editorLib = require('./editor.cjs')
+
+
+// Exercise the shipped Markdown renderer and serializer across the real PM schema.
+{
+  const src = require('node:fs').readFileSync(require.resolve('../../client.js'), 'utf8')
+  const marker = '    return {\n      // Declaring no services'
+  const pos = src.indexOf(marker)
+  const assert = require('node:assert/strict')
+  assert.notEqual(pos, -1)
+  let codec
+  const host = { __ModuleLoader__: { load({ factory }) {
+    codec = factory(() => ({ createElement: (type, props, ...children) => ({ type, props: { ...props, children } }) }))
+  } } }
+  require('node:vm').runInNewContext(src.slice(0, pos) + 'return {markdownToHtml, serializeMarkdown}; } })', { window: host })
+  const source = '7. seven\n8. eight\n\n| A\\|B | Path |\n| --- | --- |\n| x | C:\\docs |\n'
+  const html = codec.markdownToHtml(source, {})
+  const container = document.createElement('div')
+  const pm = editorLib.create({ root: container, html })
+  const root = document.createElement('div')
+  root.innerHTML = pm.getHtml()
+  assert.equal(root.querySelector('ol').start, 7)
+  assert.equal(root.querySelectorAll('th').length, 2)
+  assert.equal(root.querySelector('th').textContent, 'A|B')
+  const saved = codec.serializeMarkdown(root)
+  assert.match(saved, /^7\. seven\n8\. eight/)
+  assert.ok(saved.includes('| A\\|B | Path |'))
+  root.innerHTML = codec.markdownToHtml(saved, {})
+  assert.equal(root.querySelectorAll('td')[1].textContent, 'C:\\docs')
+  pm.destroy()
+  console.log('ok   Markdown → editor → Markdown preserves list start and escaped table cells')
+}
+
+// Host responsive decoration on the code element must not make ProseMirror
+// rebuild it and invalidate the browser's native caret range.
+{
+  const container = document.createElement('div')
+  const pm = editorLib.create({
+    root: container,
+    html: '<p>before</p><pre data-lang="js"><code>const value = 1</code></pre><p>after</p>',
+  })
+  const pre = container.querySelector('pre')
+  pre.setAttribute('data-dsh-responsive-part', 'code')
+  const observer = pm.view.domObserver
+  observer.flush()
+  if (container.querySelector('pre') !== pre) throw new Error('descendant responsive decoration rebuilt the code block')
+  pm.destroy()
+  console.log('ok   Host responsive code attributes do not rebuild code blocks')
+}
 
 let failed = 0
 const check = (name, ok, extra) => {
@@ -328,8 +377,59 @@ check('undo brings the deleted block back', gripEditor.undo() === true && /第�
 gripEditor.destroy()
 gripRoot.remove()
 
-if (failed) {
-  console.log(failed + ' failure(s)')
-  process.exit(1)
+/* Selection notifications and mouseup must not restore a stale caret or focus. */
+async function selectionRegression() {
+  const selectionRoot = document.createElement('div')
+  const other = document.createElement('button')
+  document.body.append(selectionRoot, other)
+  const selections = []
+  let changes = 0
+  const selectedEditor = editorLib.create({
+    root: selectionRoot,
+    html: '<p>select these words</p>',
+    onSelection: (value) => selections.push(value.text),
+    onChange: () => { changes += 1 },
+  })
+  const view = selectedEditor.view
+  view.dispatch(view.state.tr.setSelection(view.state.selection.constructor.create(view.state.doc, 1, 7)))
+  check('selection-only transaction updates the selection listener', selections.at(-1) === 'select', selections)
+  check('selection-only transaction does not report a document edit', changes === 0, changes)
+
+  other.focus()
+  const text = view.dom.querySelector('p').firstChild
+  const range = document.createRange()
+  range.setStart(text, 7)
+  range.setEnd(text, 12)
+  const picked = window.getSelection()
+  picked.removeAllRanges()
+  picked.addRange(range)
+  view.props.handleDOMEvents.mouseup(view, new window.MouseEvent('mouseup', { clientX: 10, clientY: 10 }))
+  await new Promise((resolve) => window.setTimeout(resolve, 20))
+  check('mouseup synchronizes a native text range', selectedEditor.getSelection().text === 'these', selectedEditor.getSelection().text)
+  check('mouseup synchronization does not steal focus', document.activeElement === other)
+  check('mouseup synchronization notifies the selection listener', selections.at(-1) === 'these', selections)
+
+  // A native double-click can update the state before its DOM selection settles.
+  view.dispatch(view.state.tr.setSelection(view.state.selection.constructor.create(view.state.doc, 1, 7)))
+  view.domObserver.stop()
+  picked.collapse(text, 0)
+  view.posAtCoords = () => ({ pos: 2, inside: 0 })
+  view.props.handleDOMEvents.mouseup(view, new window.MouseEvent('mouseup', { detail: 2, clientX: 10, clientY: 10 }))
+  await new Promise((resolve) => window.setTimeout(resolve, 20))
+  check('collapsed mouseup does not overwrite the native state selection', view.state.selection.from === 1 && view.state.selection.to === 7,
+    { from: view.state.selection.from, to: view.state.selection.to })
+  selectedEditor.destroy()
+  selectionRoot.remove()
+  other.remove()
 }
-console.log('vendor editor cases passed')
+
+selectionRegression().then(() => {
+  if (failed) {
+    console.log(failed + ' failure(s)')
+    process.exit(1)
+  }
+  console.log('vendor editor cases passed')
+}).catch((error) => {
+  console.error(error)
+  process.exit(1)
+})

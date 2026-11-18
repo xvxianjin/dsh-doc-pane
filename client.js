@@ -80,6 +80,7 @@ window.__ModuleLoader__.load({
       loadFailed: '读取失败',
       openFailed: '打开失败',
       saveFailed: '保存失败',
+      staleReply: '文档已更改，未应用这次 AI 回复。',
       conflict: '这个文档在磁盘上已经被改动过了。',
       overwrite: '用我的版本覆盖',
       loadLatest: '载入最新内容',
@@ -196,6 +197,7 @@ window.__ModuleLoader__.load({
       loadFailed: 'Could not read the file',
       openFailed: 'Could not open the document',
       saveFailed: 'Could not save the file',
+      staleReply: 'The document changed. The AI reply was not applied.',
       conflict: 'This document changed on disk meanwhile.',
       overwrite: 'Overwrite with mine',
       loadLatest: 'Load latest',
@@ -359,21 +361,21 @@ window.__ModuleLoader__.load({
     }
 
     function postJson(pathname, payload, sessionId) {
-      const session = sessionId || visibility.session
+      const session = sessionId
       return request(pathname, {
         method: 'POST',
         body: JSON.stringify(session ? { ...payload, session } : payload),
       })
     }
 
-    const listRecent = (folder) => postJson('/recent', folder ? { dir: folder } : {})
+    const listRecent = (folder, session) => postJson('/recent', folder ? { dir: folder } : {}, session)
     const readDoc = (path, sessionId) => postJson('/read', { path }, sessionId)
     const writeDoc = (payload, sessionId) => postJson('/write', payload, sessionId)
     const rewriteDoc = (payload) => postJson('/rewrite', payload)
     const chatDoc = (payload, sessionId) => postJson('/chat', payload, sessionId)
-    const listModels = () => postJson('/models', {})
-    const listSkills = () => postJson('/skills', {})
-    const statPath = (path) => postJson('/stat', { path })
+    const listModels = (session) => postJson('/models', {}, session)
+    const listSkills = (session) => postJson('/skills', {}, session)
+    const statPath = (path, session) => postJson('/stat', { path }, session)
 
     /* ------------------------------------------------------------------ */
     /* word-level diff                                                     */
@@ -729,13 +731,22 @@ window.__ModuleLoader__.load({
       return /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(line)
     }
 
-    function splitRow(line) {
-      return line
-        .trim()
-        .replace(/^\|/, '')
-        .replace(/\|$/, '')
-        .split('|')
-        .map((cell) => cell.trim())
+    function tableCells(line) {
+      const cells = []
+      let start = line.indexOf('|') + 1
+      let text = ''
+      const push = () => cells.push({ text: text.trim(), start: start + text.length - text.trimStart().length })
+      for (let i = start; i < line.length; i++) {
+        const ch = line[i]
+        if (ch === '\\' && (line[i + 1] === '|' || line[i + 1] === '\\')) text += line[++i]
+        else if (ch === '|') {
+          push()
+          text = ''
+          start = i + 1
+        } else text += ch
+      }
+      if (text.trim() || !cells.length) push()
+      return cells
     }
 
     function translateOr(t, key, fallback) {
@@ -929,8 +940,9 @@ window.__ModuleLoader__.load({
 
         if (/^\s*([-*+]|\d+[.)])\s+/.test(line)) {
           const ordered = /^\s*\d+[.)]\s+/.test(line)
+          const start = ordered ? Number(line.match(/^\s*(\d+)/)[1]) : undefined
           const items = []
-          while (i < lines.length && /^\s*([-*+]|\d+[.)])\s+/.test(lines[i])) {
+          while (i < lines.length && (ordered ? /^\s*\d+[.)]\s+/ : /^\s*[-*+]\s+/).test(lines[i])) {
             const raw = lines[i]
             const id = nextKey()
             const indent = Math.min(3, Math.floor((raw.match(/^\s*/)[0].length || 0) / 2))
@@ -968,37 +980,17 @@ window.__ModuleLoader__.load({
             )
             i++
           }
-          blocks.push(h(ordered ? 'ol' : 'ul', { key: nextKey(), className: 'dsp-md-list' }, items))
+          blocks.push(h(ordered ? 'ol' : 'ul', { key: nextKey(), className: 'dsp-md-list', start }, items))
           continue
         }
 
         if (/^\s*\|/.test(line) && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
-          // Where each cell's text begins within its raw row, for offset mapping.
-          const cellStarts = (raw) => {
-            const out = []
-            let cursor = raw.search(/\|/)
-            if (cursor < 0) cursor = 0
-            else cursor += 1
-            String(raw)
-              .slice(cursor)
-              .split('|')
-              .forEach((cell) => {
-                const lead = cell.length - cell.trimStart().length
-                out.push(cursor + lead)
-                cursor += cell.length + 1
-              })
-            return out
-          }
-          const headRaw = lines[i]
           const headIndex = i
-          const head = splitRow(headRaw)
-          const headCells = cellStarts(headRaw)
+          const head = tableCells(lines[i])
           i += 2
           const rows = []
-          const rowRaws = []
           while (i < lines.length && /^\s*\|/.test(lines[i])) {
-            rows.push(splitRow(lines[i]))
-            rowRaws.push({ index: i, line: lines[i] })
+            rows.push(tableCells(lines[i]))
             i++
           }
           const id = nextKey()
@@ -1018,8 +1010,8 @@ window.__ModuleLoader__.load({
                     head.map((cell, c) =>
                       h(
                         'th',
-                        { key: `${id}-h${c}`, 'data-src': srcOf(headIndex, headCells[c] || 0) },
-                        renderInline(cell, `${id}-h${c}`, srcOf(headIndex, headCells[c] || 0)),
+                        { key: `${id}-h${c}`, 'data-src': srcOf(headIndex, cell.start) },
+                        renderInline(cell.text, `${id}-h${c}`, srcOf(headIndex, cell.start)),
                       ),
                     ),
                   ),
@@ -1032,11 +1024,12 @@ window.__ModuleLoader__.load({
                       'tr',
                       { key: `${id}-r${r}` },
                       head.map((_, c) => {
-                        const rowStarts = cellStarts(rowRaws[r].line)
+                        const cell = row[c] || { text: '', start: 0 }
+                        const offset = srcOf(headIndex + 2 + r, cell.start)
                         return h(
                           'td',
-                          { key: `${id}-r${r}c${c}`, 'data-src': srcOf(rowRaws[r].index, rowStarts[c] || 0) },
-                          renderInline(row[c] || '', `${id}-r${r}c${c}`, srcOf(rowRaws[r].index, rowStarts[c] || 0)),
+                          { key: `${id}-r${r}c${c}`, 'data-src': offset },
+                          renderInline(cell.text, `${id}-r${r}c${c}`, offset),
                         )
                       }),
                     ),
@@ -1394,7 +1387,7 @@ window.__ModuleLoader__.load({
         const value = props[name]
         if (value === undefined || value === null || value === false) return
         if (name === 'className') return
-        if (name === 'href' || name === 'src' || name === 'alt' || name === 'title') {
+        if (name === 'href' || name === 'src' || name === 'alt' || name === 'title' || (type === 'ol' && name === 'start')) {
           attrs.push(name + '="' + escapeAttr(value) + '"')
           return
         }
@@ -1559,7 +1552,7 @@ window.__ModuleLoader__.load({
       const ordered = list.tagName.toLowerCase() === 'ol'
       const pad = '  '.repeat(depth)
       const lines = []
-      let counter = 0
+      let counter = ordered ? list.start - 1 : 0
       Array.prototype.forEach.call(list.children, (item) => {
         if (item.tagName.toLowerCase() !== 'li') return
         counter += 1
@@ -1585,7 +1578,7 @@ window.__ModuleLoader__.load({
       Array.prototype.forEach.call(table.querySelectorAll('tr'), (row) => {
         const cells = []
         Array.prototype.forEach.call(row.children, (cell) => {
-          cells.push(inlineMarkdown(cell).replace(/\s*\n\s*/g, ' ').trim())
+          cells.push(inlineMarkdown(cell).replace(/\s*\n\s*/g, ' ').trim().replace(/[\\|]/g, '\\$&'))
         })
         if (cells.length) rows.push(cells)
       })
@@ -2416,14 +2409,9 @@ window.__ModuleLoader__.load({
         // A table row renders as separate cells, so a row-wide fragment would
         // never be found in the rendered text: mark the cells instead.
         if (raw.startsWith('|')) {
-          raw
-            .replace(/^\|/, '')
-            .replace(/\|$/, '')
-            .split('|')
-            .forEach((cell) => {
-              const text = cell.trim()
-              if (text.length >= 2) texts.push({ text, before: '' })
-            })
+          tableCells(raw).forEach(({ text }) => {
+            if (text.length >= 2) texts.push({ text, before: '' })
+          })
           return
         }
         const text = fragmentText(raw)
@@ -2518,12 +2506,7 @@ window.__ModuleLoader__.load({
 
     function makePanel(t, ctx) {
       return function DocPane(props) {
-        const state = usePanelState()
-        const link = useLinkTarget()
-        const browse = useBrowseRequest()
-        // The header button records the Session it was clicked in; the slot's
-        // injected id is the fallback when a runtime does not hand one over.
-        const session = state.session || (props && props.sessionId ? String(props.sessionId) : '')
+        const session = props && props.sessionId ? String(props.sessionId) : ''
         const open = true
 
         // A document link clicked in the chat opens this tab with a
@@ -2537,7 +2520,10 @@ window.__ModuleLoader__.load({
           // A body rendered outside a committed tab has no record to read.
           tabInfo = null
         }
-        const tabAddress = tabInfo && tabInfo.tab && typeof tabInfo.tab.address === 'string' ? tabInfo.tab.address : ''
+        const tab = tabInfo && tabInfo.tab
+        const navigation = tab && tab.navigation
+        const tabAddress = (navigation && navigation.address) || (tab && tab.contentId) || ''
+        const browse = !parseFileAddress(tabAddress) && navigation && navigation.params && navigation.params.browse ? navigation.revision : 0
         const linked = tabAddress ? parseFileAddress(tabAddress) : null
         const linkPath = linked ? linked.path : ''
         const linkSession = linked && linked.scope === 'session' ? linked.sessionId : ''
@@ -2656,6 +2642,25 @@ window.__ModuleLoader__.load({
         const previewRef = React.useRef(null)
         const mirrorRef = React.useRef(null)
         const rootRef = React.useRef(null)
+        // A global quote guard can cancel edits on protocol headings before the rich editor receives them.
+        // Observe cancellation without interfering with the other plugin's handlers; source editing uses a textarea.
+        React.useEffect(() => {
+          if (mode !== 'doc' || !path) return
+          const recover = (event) => {
+            if (!event.isTrusted || event.defaultPrevented || !rootRef.current?.contains(event.target)) return
+            const editor = event.target?.closest?.('[contenteditable="true"]')
+            if (!editor) return
+            const selection = window.getSelection()
+            const anchor = selection?.anchorNode
+            const row = (anchor?.nodeType === 1 ? anchor : anchor?.parentElement)?.closest('p,li,div')
+            if (!row || !editor.contains(row) || !/^【(?:引用|批注)[^\n]*】$/.test(row.textContent.trim())) return
+            queueMicrotask(() => { if (event.defaultPrevented && rootRef.current?.contains(editor)) setMode('source') })
+          }
+          window.addEventListener('beforeinput', recover, true)
+          const key = event => { if (event.key.length === 1 || ['Backspace', 'Delete', 'Enter'].includes(event.key)) recover(event) }
+          window.addEventListener('keydown', key, true)
+          return () => { window.removeEventListener('beforeinput', recover, true); window.removeEventListener('keydown', key, true) }
+        }, [mode, path])
         const dirty = content !== saved
         const dirtyRef = React.useRef(dirty)
         const mtimeRef = React.useRef(mtime)
@@ -2721,70 +2726,41 @@ window.__ModuleLoader__.load({
         const eolRef = React.useRef('\n')
         const toDisk = (text) => (eolRef.current === '\r\n' ? String(text).replace(/\n/g, '\r\n') : text)
 
-        const openFile = React.useCallback(
-          async (nextPath, nextName, nextSession) => {
-            if (dirtyRef.current && nextPath !== pathRef.current) {
-              if (!window.confirm(t('discardConfirm'))) return
-            }
-            setDocBusy(true)
-            setDocError('')
-            setMessages([])
-            setSelection(null)
-            setConflict(null)
-            try {
-              const result = await readDoc(nextPath, nextSession)
-              docSessionRef.current = nextSession || visibility.session || ''
-              setDocSession(docSessionRef.current)
-              const raw = String(result.content == null ? '' : result.content)
-              eolRef.current = raw.includes('\r\n') ? '\r\n' : '\n'
-              const text = eolRef.current === '\r\n' ? raw.replace(/\r\n/g, '\n') : raw
-              setPath(result.path)
-              setName(nextName || result.path.split('/').pop())
-              setContent(text)
-              setSaved(text)
-              setMtime(result.mtime)
-              setPending(readPending(result.path, result.mtime) || [])
-            } catch (error) {
-              setDocError(error.message)
-            } finally {
-              setDocBusy(false)
-            }
-          },
-          [t],
-        )
-
-        /**
-         * Lists the documents of a folder (the Session workspace by default).
-         * Listing never opens anything by itself: a document is opened only by
-         * a link in the conversation or by the user picking one.
-         */
-        const loadFiles = React.useCallback(async (nextFolder) => {
-          setListBusy(true)
-          setFilesError('')
-          try {
-            const result = await listRecent(nextFolder)
-            const list = Array.isArray(result.files) ? result.files : []
-            setFiles(list)
-            setFolderRoot(result.root || '')
-          } catch (error) {
-            setFilesError(error.message)
-          } finally {
-            setListBusy(false)
+        const life = React.useRef({})
+        const savedRef = React.useRef(saved)
+        savedRef.current = saved
+        const adoptDisk = (result) => {
+          const raw = String(result.content ?? '')
+          eolRef.current = raw.includes('\r\n') ? '\r\n' : '\n'
+          const text = raw.replace(/\r\n/g, '\n')
+          life.current.version = result.version
+          life.current.conflict = false
+          contentRef.current = savedRef.current = text
+          mtimeRef.current = result.mtime
+          dirtyRef.current = false
+          setContent(text)
+          setSaved(text)
+          setMtime(result.mtime)
+          setConflict(null)
+          return text
+        }
+        const flushEditor = () => {
+          if (!pmTimerRef.current) return contentRef.current
+          window.clearTimeout(pmTimerRef.current)
+          pmTimerRef.current = 0
+          if (pmRef.current) {
+            const next = serializeMarkdown(pmRef.current.view.dom)
+            domDirtyRef.current = true
+            pmContentRef.current = contentRef.current = next
+            dirtyRef.current = next !== savedRef.current
+            setContent(next)
           }
-        }, [])
-
-        /** Reload the list even when the folder did not change. */
-        const bumpRefresh = React.useCallback(() => setRefreshKey((key) => key + 1), [])
-
-        /**
-         * Drops the open document and goes back to the document list of the
-         * active conversation. Nothing opens here: the user picks a file (or a
-         * folder, or pastes a path) from the list.
-         */
-        const followSession = React.useCallback(() => {
-          if (dirtyRef.current && !window.confirm(t('discardConfirm'))) return
-          docSessionRef.current = visibility.session || ''
-          setDocSession(docSessionRef.current)
+          return contentRef.current
+        }
+        const leaveDocument = () => {
+          flushEditor()
+          if (dirtyRef.current && !window.confirm(t('discardConfirm'))) return false
+          life.current = {}
           pathRef.current = ''
           dirtyRef.current = false
           setPath('')
@@ -2796,10 +2772,85 @@ window.__ModuleLoader__.load({
           setPending([])
           setSelection(null)
           setConflict(null)
+          setComposer('')
+          setThinking(false)
+          setNotice('')
+          setDocBusy(false)
           setDocError('')
+          return true
+        }
+        React.useEffect(() => () => {
+          life.current = {}
+          window.clearTimeout(pmTimerRef.current)
+          pmTimerRef.current = 0
+        }, [])
+
+        const openFile = React.useCallback(
+          async (nextPath, nextName, nextSession) => {
+            if (!leaveDocument()) return false
+            const owner = life.current
+            const sourceSession = nextSession || session || ''
+            setDocBusy(true)
+            setDocError('')
+            setMessages([])
+            setSelection(null)
+            setConflict(null)
+            try {
+              const result = await readDoc(nextPath, sourceSession)
+              if (owner !== life.current) return false
+              pathRef.current = result.path
+              docSessionRef.current = sourceSession
+              setDocSession(sourceSession)
+              adoptDisk(result)
+              setPath(result.path)
+              setName(nextName || result.path.split('/').pop())
+              setPending(readPending(result.path, result.mtime) || [])
+              return true
+            } catch (error) {
+              if (owner === life.current) setDocError(error.message)
+              return false
+            } finally {
+              if (owner === life.current) setDocBusy(false)
+            }
+          },
+          [t, session],
+        )
+
+        /**
+         * Lists the documents of a folder (the Session workspace by default).
+         * Listing never opens anything by itself: a document is opened only by
+         * a link in the conversation or by the user picking one.
+         */
+        const loadFiles = React.useCallback(async (nextFolder) => {
+          setListBusy(true)
+          setFilesError('')
+          try {
+            const result = await listRecent(nextFolder, session)
+            const list = Array.isArray(result.files) ? result.files : []
+            setFiles(list)
+            setFolderRoot(result.root || '')
+          } catch (error) {
+            setFilesError(error.message)
+          } finally {
+            setListBusy(false)
+          }
+        }, [session])
+
+        /** Reload the list even when the folder did not change. */
+        const bumpRefresh = React.useCallback(() => setRefreshKey((key) => key + 1), [])
+
+        /**
+         * Drops the open document and goes back to the document list of the
+         * active conversation. Nothing opens here: the user picks a file (or a
+         * folder, or pastes a path) from the list.
+         */
+        const followSession = React.useCallback(() => {
+          if (!leaveDocument()) return
+          docSessionRef.current = session || ''
+          setDocSession(docSessionRef.current)
           setFolder('')
           bumpRefresh()
-        }, [bumpRefresh, t])
+        }, [bumpRefresh, t, session])
 
         // The header button means "browse": the panel shows the list instead of
         // whatever document a link opened earlier.
@@ -2841,7 +2892,7 @@ window.__ModuleLoader__.load({
           if (!raw) return
           setFilesError('')
           try {
-            const info = await statPath(raw)
+            const info = await statPath(raw, session)
             if (info.kind === 'dir') {
               const target = info.absolute || raw
               setFolder(target)
@@ -2854,7 +2905,7 @@ window.__ModuleLoader__.load({
           } catch (error) {
             setFilesError(error && error.message ? error.message : String(error))
           }
-        }, [bumpRefresh, openFile])
+        }, [bumpRefresh, openFile, session])
 
 
         // The panel follows the Session whose header opened it: a different
@@ -2901,75 +2952,68 @@ window.__ModuleLoader__.load({
         React.useEffect(() => {
           if (!linkPath || linkRef.current === tabAddress) return
           linkRef.current = tabAddress
-          if (linkSession && linkSession !== session) {
-            linkGuardRef.current = linkSession
-            setActiveSession(linkSession)
-          }
-          openFile(linkPath, linkPath.split('/').pop(), linkSession || undefined)
+          openFile(linkPath, linkPath.split('/').pop(), linkSession || session)
         }, [tabAddress, linkPath, linkSession, session, openFile])
 
-        // The tab body does not always receive `useTabInfo`, so the address of
-        // a clicked chat link arrives through the store (see `hookLinks`).
-        const linkToken = React.useRef(0)
+        const line = Number(navigation?.params?.line ?? linked?.line)
+        const jumpKey = JSON.stringify([tabAddress, navigation?.revision, line])
+        const handledJump = React.useRef('')
         React.useEffect(() => {
-          if (!link || !link.token || linkToken.current === link.token) return
-          linkToken.current = link.token
-          const tail = String(link.path || '').split(/[\\/]/).filter(Boolean).pop()
-          if (link.session && link.session !== session) {
-            linkGuardRef.current = link.session
-            setActiveSession(link.session)
-          }
-          openFile(link.path, tail, link.session || undefined)
-        }, [link, session, openFile])
+          if (!linkPath || !path || docBusy || !Number.isSafeInteger(line) || line < 1 || handledJump.current === jumpKey || tab?.visible === false) return
+          if (mode !== 'source') { setMode('source'); return }
+          const area = areaRef.current
+          if (!area) return
+          handledJump.current = jumpKey
+          const rows = area.value.split('\n')
+          const index = Math.min(line, rows.length) - 1
+          const offset = rows.slice(0, index).reduce((n, row) => n + row.length + 1, 0)
+          area.focus({ preventScroll: true })
+          area.setSelectionRange(offset, offset + rows[index].length)
+          area.scrollTop = Math.max(0, index * (parseFloat(window.getComputedStyle(area).lineHeight) || 20) - area.clientHeight / 2)
+        }, [jumpKey, line, mode, docBusy, path, linkPath, tab?.visible])
 
-        const save = React.useCallback(async (force) => {
-          if (!path || !dirty) return
-          setDocBusy(true)
-          try {
-            const result = await writeDoc({
-              path,
-              content: toDisk(content),
-              ...(force || !mtime ? {} : { expectedMtime: mtime }),
-            }, docSessionRef.current || undefined)
-            setSaved(content)
-            setMtime(result.mtime)
-            setConflict(null)
-            flash(t('saved'))
-          } catch (error) {
-            if (error.status === 409 && error.data) {
-              setConflict({ content: error.data.content || '', mtime: error.data.mtime || 0 })
-            } else {
-              setDocError(error.message)
+        const writeFileNow = React.useCallback((next, force = false) => {
+          const owner = life.current
+          const target = pathRef.current
+          const sourceSession = docSessionRef.current
+          if (!target) return Promise.resolve(false)
+          const diskText = toDisk(next)
+          const run = async () => {
+            if (life.current !== owner || (!force && owner.conflict)) return false
+            if (!force && savedRef.current === next) return true
+            setDocBusy(true)
+            try {
+              const guard = force ? {} : { expectedVersion: owner.version, expectedMtime: mtimeRef.current }
+              const result = await writeDoc({ path: target, content: diskText, ...guard }, sourceSession)
+              if (life.current !== owner) return false
+              owner.version = result.version
+              owner.conflict = false
+              savedRef.current = next
+              mtimeRef.current = result.mtime
+              setSaved(next)
+              setMtime(result.mtime)
+              setConflict(null)
+              return true
+            } catch (error) {
+              if (life.current !== owner) return false
+              if (error.status === 409 && error.data) {
+                owner.conflict = true
+                setConflict(error.data)
+              } else {
+                flash(error.message || t('saveFailed'))
+              }
+              return false
             }
-          } finally {
-            setDocBusy(false)
           }
-        }, [path, dirty, content, mtime, flash, t])
-
-        /**
-         * Writes a text this half produced itself — the model's edit or an undo
-         * of it — keeping the optimistic mtime guard.
-         */
-        const writeFileNow = React.useCallback(
-          (next) => {
-            if (!path) return
-            const payload = { path, content: toDisk(next), ...(mtime ? { expectedMtime: mtime } : {}) }
-            writeDoc(payload, docSessionRef.current || undefined)
-              .then((result) => {
-                setSaved(next)
-                setMtime(result.mtime)
-                setConflict(null)
-              })
-              .catch((error) => {
-                if (error && error.status === 409 && error.data) {
-                  setConflict({ content: error.data.content || '', mtime: error.data.mtime || 0 })
-                } else {
-                  flash(t('saveFailed'))
-                }
-              })
-          },
-          [path, mtime, flash, t],
-        )
+          const task = (owner.queue || Promise.resolve()).then(run)
+          owner.queue = task
+          return task.finally(() => {
+            if (owner.queue !== task) return
+            owner.queue = null
+            if (life.current === owner) setDocBusy(false)
+          })
+        }, [flash, t])
+        const save = React.useCallback((force) => writeFileNow(flushEditor(), force), [writeFileNow])
 
         /**
          * Where a mark sits in the current text: the offsets recorded when it
@@ -3048,33 +3092,28 @@ window.__ModuleLoader__.load({
 
         React.useEffect(() => {
           if (!open || !path) return undefined
+          const owner = life.current
+          let active = true
+          let polling = false
           const timer = window.setInterval(async () => {
-            if (!pathRef.current) return
+            if (!active || polling || owner.queue || life.current !== owner || pathRef.current !== path) return
+            polling = true
+            const stamp = mtimeRef.current
+            const version = owner.version
             try {
-              const result = await readDoc(pathRef.current, docSessionRef.current || undefined)
-              if (result.mtime !== mtimeRef.current) {
+              const result = await readDoc(path, docSessionRef.current || undefined)
+              if (!active || life.current !== owner || owner.queue || stamp !== mtimeRef.current || version !== owner.version) return
+              if (version && result.version ? version !== result.version : result.mtime !== stamp) {
+                flushEditor()
                 // Local edits are never thrown away silently: offer the newer
                 // file instead of hiding the fact that the two versions differ.
                 if (dirtyRef.current) {
-                  setConflict((current) =>
-                    current && current.mtime === result.mtime
-                      ? current
-                      : {
-                          content:
-                            eolRef.current === '\r\n'
-                              ? String(result.content == null ? '' : result.content).replace(/\r\n/g, '\n')
-                              : result.content,
-                          mtime: result.mtime,
-                        },
-                  )
+                  owner.conflict = true
+                  setConflict(result)
                   return
                 }
                 const previous = contentRef.current
-                const fresh = String(result.content == null ? '' : result.content)
-                const normalizedFresh = eolRef.current === '\r\n' ? fresh.replace(/\r\n/g, '\n') : fresh
-                setContent(normalizedFresh)
-                setSaved(normalizedFresh)
-                setMtime(result.mtime)
+                const normalizedFresh = adoptDisk(result)
                 setMessages((list) => list.filter((item) => !item.edit))
                 setPending((list) => [...list, ...pendingFragments(previous, normalizedFresh, 'x')].slice(-60))
                 setNotice(t('externalReloaded'))
@@ -3082,9 +3121,11 @@ window.__ModuleLoader__.load({
               }
             } catch {
               // polling is best effort
+            } finally {
+              polling = false
             }
           }, 6000)
-          return () => window.clearInterval(timer)
+          return () => { active = false; window.clearInterval(timer) }
         }, [open, path, t])
 
         const trackSelection = React.useCallback(() => {
@@ -3237,16 +3278,9 @@ window.__ModuleLoader__.load({
           setSelection({ start: located.start, end, text: content.slice(located.start, end) })
         }, [content, pmSourceOf])
 
-        pmSyncRef.current = () => {          if (pmTimerRef.current) window.clearTimeout(pmTimerRef.current)
-          pmTimerRef.current = window.setTimeout(() => {
-            pmTimerRef.current = 0
-            const instance = pmRef.current
-            if (!instance) return
-            domDirtyRef.current = true
-            const next = serializeMarkdown(instance.view.dom)
-            pmContentRef.current = next
-            setContent(next)
-          }, 220)
+        pmSyncRef.current = () => {
+          window.clearTimeout(pmTimerRef.current)
+          pmTimerRef.current = window.setTimeout(flushEditor, 220)
         }
 
         pmSelectionRef.current = (picked) => {
@@ -3686,7 +3720,8 @@ window.__ModuleLoader__.load({
         /** Feishu-style autosave: stop typing for a moment and the file follows. */
         React.useEffect(() => {
           if (!path || !dirty) return undefined
-          const timer = window.setTimeout(() => { save() }, 1200)
+          const owner = life.current
+          const timer = window.setTimeout(() => { if (life.current === owner) save() }, 1200)
           return () => window.clearTimeout(timer)
         }, [content, dirty, path, save])
 
@@ -3773,19 +3808,6 @@ window.__ModuleLoader__.load({
           openMarkMenu(event)
         }, [openMarkMenu, t])
 
-        /** Focusing only: the browser keeps the drag gesture it started. */
-        const docMouseDown = React.useCallback((event) => {
-          const instance = pmRef.current
-          if (!instance || !instance.view || event.button !== 0) return
-          try {
-            if (typeof instance.view.hasFocus === 'function' && !instance.view.hasFocus()) {
-              instance.view.focus()
-            }
-          } catch (error) {
-            console.error('dsh-doc-pane: 编辑器聚焦失败', error)
-          }
-        }, [])
-
 
         /**
          * In the edit view a mark cannot be clicked: the textarea sits above the
@@ -3844,7 +3866,7 @@ window.__ModuleLoader__.load({
         React.useEffect(() => {
           if (!path) return undefined
           let live = true
-          Promise.all([listModels(), listSkills()])
+          Promise.all([listModels(docSession), listSkills(docSession)])
             .then(([models, skills]) => {
               if (!live) return
               if (models && Array.isArray(models.providers)) setModelRoutes(models)
@@ -3856,7 +3878,14 @@ window.__ModuleLoader__.load({
           return () => {
             live = false
           }
-        }, [path])
+        }, [path, docSession])
+
+        React.useEffect(() => {
+          setModelRoutes(null)
+          setSkillOptions([])
+          setPickedSkills([])
+          setModelPick(null)
+        }, [docSession])
 
         const modelLabel = () => {
           const pick = modelPick || (modelRoutes && modelRoutes.current) || null
@@ -3951,7 +3980,14 @@ window.__ModuleLoader__.load({
           const text = composer.trim()
           const quote = selection
           if (!text && !quote) return
-          if (thinking) return
+          const owner = life.current
+          if (!path || thinking || owner.thinking) return
+          const content = flushEditor()
+          const base = content
+          if (quote && base.slice(quote.start, quote.end) !== quote.text) { flash(t('markLost')); return }
+          const version = owner.version
+          const stamp = mtimeRef.current
+          owner.thinking = true
           const history = messages.map((item) => ({ role: item.role, text: item.text })).slice(-10)
           const prompt = text || t('defaultPrompt')
           const userItem = { id: 'u' + Date.now(), role: 'user', text: prompt, quote: quote ? quote.text : '' }
@@ -3975,14 +4011,19 @@ window.__ModuleLoader__.load({
                   }
                 : null,
             }, docSessionRef.current || undefined)
+            if (life.current !== owner) return
+            if (flushEditor() !== base || version !== owner.version || stamp !== mtimeRef.current || owner.conflict) {
+              flash(t('staleReply'))
+              return
+            }
             const reply = { id: 'a' + Date.now(), role: 'assistant', text: String(result.text || '') }
             const autoSkills = (Array.isArray(result.skills) ? result.skills : []).filter((item) => !pickedSkills.includes(item))
             if (autoSkills.length) reply.autoSkills = autoSkills
             if (result.kind === 'edit' && quote) {
               const replacement = String(reply.text || '')
-              const deletedMark = !replacement.trim()
+              const deletedMark = !replacement
               const span = deletedMark ? sectionSpan(content, quote.start, quote.end) : null
-              const applied = replacement.trim()
+              const applied = replacement
                 ? {
                     next: content.slice(0, quote.start) + replacement + content.slice(quote.end),
                     start: quote.start,
@@ -3991,8 +4032,8 @@ window.__ModuleLoader__.load({
                 : applyDeletion(content, span.start, span.end)
               const mark = {
                 id: 'p' + Date.now(),
-                text: replacement.trim() ? replacement : '',
-                deleted: !replacement.trim(),
+                text: replacement ? replacement : '',
+                deleted: !replacement,
                 block: applied.block === true,
                 before: typeof applied.before === 'string' ? applied.before : quote.text,
                 display: deletedMark ? ghostLabel(applied.before) : undefined,
@@ -4000,20 +4041,23 @@ window.__ModuleLoader__.load({
                   ? (content.slice(Math.max(0, applied.start - 40), applied.start).split('\n').filter(Boolean).pop() || '')
                   : undefined,
                 start: applied.start,
-                end: applied.start + (replacement.trim() ? replacement.length : 0),
+                end: applied.start + (replacement ? replacement.length : 0),
               }
               setContent(applied.next)
               setPending((list) => [...list, mark].slice(-60))
               setSelection(null)
-              writeFileNow(applied.next)
+              const persisted = await writeFileNow(applied.next)
+              if (life.current !== owner) return
               reply.text = ''
-              reply.note = t(replacement.trim() ? 'editAppliedNote' : 'deleteAppliedNote')
+              reply.note = t(!persisted ? 'saveFailed' : deletedMark ? 'deleteAppliedNote' : 'editAppliedNote')
+              reply.error = !persisted
             }
             setMessages((list) => [...list, reply])
           } catch (error) {
-            setMessages((list) => [...list, { id: 'e' + Date.now(), role: 'assistant', text: t('chatFailed') + '：' + error.message, error: true }])
+            if (life.current === owner) setMessages((list) => [...list, { id: 'e' + Date.now(), role: 'assistant', text: t('chatFailed') + '：' + error.message, error: true }])
           } finally {
-            setThinking(false)
+            owner.thinking = false
+            if (life.current === owner) setThinking(false)
           }
         }, [composer, selection, thinking, messages, path, name, content, t, modelPick, pickedSkills, writeFileNow])
 
@@ -4051,7 +4095,7 @@ window.__ModuleLoader__.load({
             'div',
             { className: 'dsp-head-main' },
             path
-              ? h(IconButton, { title: t('files'), onClick: () => { setPath(''); setName(''); setContent(''); setSaved(''); setMtime(0); setMessages([]); setSelection(null); setDocError(''); loadFiles() } }, h(BackIcon))
+              ? h(IconButton, { title: t('files'), onClick: () => { if (leaveDocument()) loadFiles(folder) } }, h(BackIcon))
               : h(DocIcon),
             h(
               'div',
@@ -4290,10 +4334,9 @@ window.__ModuleLoader__.load({
               ref: docRef,
               className: 'dsp-body dsp-preview dsp-wys dsp-pm',
               spellCheck: false,
-              onMouseDown: docMouseDown,
               onMouseUp: trackPmSelection,
               onKeyUp: trackPmSelection,
-              onPaste: pmPaste,
+              onPasteCapture: pmPaste,
               onMouseMove: trackGrip,
               onMouseLeave: leaveGrip,
               onClick: docClick,
@@ -4783,10 +4826,8 @@ window.__ModuleLoader__.load({
                 {
                   quiet: true,
                   onClick: () => {
-                    setContent(conflict.content)
-                    setSaved(conflict.content)
-                    setMtime(conflict.mtime)
-                    setConflict(null)
+                    flushEditor()
+                    adoptDisk(conflict)
                     setPending([])
                   },
                 },
@@ -4829,8 +4870,6 @@ window.__ModuleLoader__.load({
             title: t('openButton'),
             'aria-label': t('openButton'),
             onClick: async () => {
-              const sessionId = props && props.sessionId ? String(props.sessionId) : ''
-              if (sessionId) setActiveSession(sessionId)
               const right = service(ctx, 'sidebarRight')
               if (!right || typeof right.openTab !== 'function') {
                 console.error('dsh-doc-pane: sidebarRight is unavailable')
@@ -4838,9 +4877,8 @@ window.__ModuleLoader__.load({
               }
               // The header button is the browsing entry: the panel shows the
               // document list, not a file it happens to have open.
-              requestBrowse()
               try {
-                await right.openTab('doc-pane', { params: sessionId ? { session: sessionId } : {} })
+                await right.openTab(TAB_KIND, { params: { browse: true } })
               } catch (error) {
                 console.error('dsh-doc-pane: openTab failed', error)
               }
@@ -5891,6 +5929,7 @@ window.__ModuleLoader__.load({
 .dsp-doc-bar {
   position: fixed;
   z-index: 41;
+  pointer-events: none;
   display: flex;
   align-items: center;
   flex-wrap: wrap;
@@ -5905,6 +5944,7 @@ window.__ModuleLoader__.load({
 .dsp-doc-bar-btn {
   width: calc(30px * var(--dsp-zoom, 1));
   height: calc(30px * var(--dsp-zoom, 1));
+  pointer-events: auto;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -5935,6 +5975,7 @@ window.__ModuleLoader__.load({
 .dsp-doc-bar-link { display: flex; align-items: center; gap: 3px; }
 .dsp-doc-bar-input {
   width: calc(160px * var(--dsp-zoom, 1));
+  pointer-events: auto;
   border: 1px solid #e6e8eb;
   border-radius: 6px;
   padding: calc(4px * var(--dsp-zoom, 1)) calc(6px * var(--dsp-zoom, 1));
@@ -6054,11 +6095,24 @@ window.__ModuleLoader__.load({
       const Panel = makePanel(t, c)
       const Toggle = makeToggle(t, c)
 
+      // `slots.register` throws when its target slot is not declared yet: the
+      // owning entry must declare it in its children table first. We activate
+      // immediately (empty inject list, see `apply`), so dsh-better-sidebar —
+      // which declares `sidebar.right.pane.tab` — can still be activating when
+      // this runs, and a direct `register` then aborts the whole mount (the
+      // panel body, the header toggle and the tab type all disappear together).
+      // Deferring through `slots.inject` waits for the declaration instead.
+      const registerSlot = (name, spec, component) => {
+        if (typeof slots.inject === 'function') return slots.inject(name, () => slots.register(spec, component))
+        return slots.register(spec, component)
+      }
+
       // Docked as a right-column tab, beside the chat instead of over it. The
       // type is a page type: it names no address pattern and is opened by kind.
       c.effect(
         () =>
-          slots.register(
+          registerSlot(
+            'sidebar.right.pane.tab',
             { name: 'sidebar.right.pane.tab', key: TAB_ID, locale: NS, inject: (sessionId) => ({ sessionId }) },
             Panel,
           ),
@@ -6067,7 +6121,8 @@ window.__ModuleLoader__.load({
 
       c.effect(
         () =>
-          slots.register(
+          registerSlot(
+            'conversation.session.header.actions',
             { name: 'conversation.session.header.actions', id: 'dsh-doc-pane-open', order: 30 },
             Toggle,
           ),
@@ -6077,12 +6132,9 @@ window.__ModuleLoader__.load({
       // The tab type needs `sidebarRightTabs`, which may still be activating
       // when the panel is first mounted. Retry for a while instead of silently
       // dropping the type (a missing type makes `openTab` throw).
-      let typeRegistered = false
       const claimType = (host) => {
-        if (typeRegistered) return true
         const tabs = service(host, 'sidebarRightTabs')
         if (!tabs || typeof tabs.register !== 'function') return false
-        typeRegistered = true
         host.effect(
           () =>
             tabs.register({
@@ -6113,128 +6165,21 @@ window.__ModuleLoader__.load({
               title: (address) => {
                 const parsed = parseFileAddress(address)
                 if (parsed) {
-                  rememberAddress(address, parsed)
                   const tail = parsed.path.split('/').filter(Boolean).pop()
                   if (tail) return tail
                 }
                 // Opened by kind (a chat link taken before the ranking), so the
                 // address names no file: use the document just recorded.
-                const current = visibility.link
-                if (current && current.path) {
-                  const tail = String(current.path).split(/[\\/]/).filter(Boolean).pop()
-                  if (tail) return tail
-                }
                 return t('panelTitle')
               },
               keepMounted: true,
             }),
           'dsh-doc-pane: tab type',
         )
-        return true
       }
 
-      if (!claimType(c)) {
-        let attempts = 0
-        const tick = () => {
-          attempts += 1
-          try {
-            if (claimType(c)) return
-          } catch (error) {
-            console.error('dsh-doc-pane: failed to register the tab type', error)
-            return
-          }
-          // Keep trying: the type must exist before the first link is clicked,
-          // and a slow boot can take longer than a minute.
-          if (attempts < 600) setTimeout(tick, 500)
-        }
-        setTimeout(tick, 500)
-      }
+      c.inject(['sidebarRightTabs'], claimType)
 
-      // Chat links go through `sidebarRight.openResource(address)`. Our type
-      // wins the address ranking, but ranking is a contest: while the type is
-      // still registering (or when another plugin wraps the same call first) a
-      // click can land elsewhere. So a text address is taken here directly —
-      // record it, open our own tab by kind, and only pass through when that is
-      // impossible.
-      let linksHooked = false
-      const hookLinks = (host) => {
-        if (linksHooked) return true
-        const api = service(host, 'sidebarRight')
-        if (!api || typeof api.openResource !== 'function') return false
-        linksHooked = true
-        // While our own tab is being opened the calls below re-enter these
-        // methods; they must run untouched then.
-        let taking = false
-        const record = (address) => {
-          let parsed
-          try {
-            parsed = parseFileAddress(address)
-          } catch (error) {
-            console.error('dsh-doc-pane: failed to read the opened address', error)
-            return false
-          }
-          if (!parsed || !TEXT_EXT.test(parsed.path)) return false
-          setLink({
-            address: String(address),
-            path: parsed.path,
-            session: parsed.scope === 'session' ? parsed.sessionId : '',
-          })
-          if (typeRegistered && typeof api.openTab === 'function') {
-            try {
-              taking = true
-              api.openTab(TAB_KIND, {})
-              return true
-            } catch (error) {
-              console.error('dsh-doc-pane: openTab failed, falling back to the address', error)
-            } finally {
-              taking = false
-            }
-          }
-          return false
-        }
-        const disposers = []
-        // A chat link travels as `openResource(address)` from the shipped chat,
-        // but the right column also exposes pane-scoped entry points, and a
-        // third-party caller may hand the address to `placeResource` directly.
-        // Wrap them all: whichever one is used, our panel takes the address.
-        const wrap = (name, pick) => {
-          const original = api[name]
-          if (typeof original !== 'function') return
-          const wrapped = function (...args) {
-            if (taking) return original.apply(this, args)
-            const address = pick(args)
-            if (typeof address === 'string' && record(address)) return undefined
-            return original.apply(this, args)
-          }
-          api[name] = wrapped
-          disposers.push(() => {
-            if (api[name] === wrapped) api[name] = original
-          })
-        }
-        wrap('openResource', (args) => args[0])
-        wrap('placeResource', (args) => args[2])
-        wrap('openResourceIn', (args) => args[2])
-        host.effect(
-          () => () => disposers.forEach((dispose) => dispose()),
-          'dsh-doc-pane: link hook',
-        )
-        return true
-      }
-
-      if (!hookLinks(c)) {
-        let attempts = 0
-        const tick = () => {
-          attempts += 1
-          try {
-            if (hookLinks(c)) return
-          } catch (error) {
-            console.error('dsh-doc-pane: failed to hook openResource', error)
-            return
-          }
-          if (attempts < 600) setTimeout(tick, 500)
-        }
-        setTimeout(tick, 500)
-      }
     }
 
     return {

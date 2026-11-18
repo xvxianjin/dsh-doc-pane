@@ -627,6 +627,35 @@ function parseHtml(html) {
   return DOMDocParser.fromSchema(schema).parse(holder)
 }
 
+function codeBlockView(node) {
+  const dom = document.createElement('pre')
+  const contentDOM = document.createElement('code')
+  dom.appendChild(contentDOM)
+
+  const paint = (current) => {
+    const language = current.attrs.params || ''
+    dom.className = 'dsp-code dsp-code-pre'
+    dom.setAttribute('data-lang', language)
+    contentDOM.className = language ? 'language-' + language : ''
+  }
+  paint(node)
+
+  return {
+    dom,
+    contentDOM,
+    ignoreMutation(mutation) {
+      return mutation.type === 'attributes' &&
+        mutation.attributeName === 'data-dsh-responsive-part'
+    },
+    update(next) {
+      if (next.type !== node.type) return false
+      node = next
+      paint(next)
+      return true
+    },
+  }
+}
+
 function create(options) {
   const root = options && options.root
   if (!root) throw new Error('DshDocEditor: root is required')
@@ -642,6 +671,7 @@ function create(options) {
 
   const view = new EditorView(root, {
     state,
+    nodeViews: { code_block: codeBlockView },
     attributes: {
       class: 'dsp-pm',
       spellcheck: 'false',
@@ -650,9 +680,8 @@ function create(options) {
     dispatchTransaction(transaction) {
       const next = view.state.apply(transaction)
       view.updateState(next)
-      if (!transaction.docChanged) return
-      onSelectionChange()
-      if (onChange && !muted) onChange()
+      if (transaction.docChanged || transaction.selectionSet) onSelectionChange()
+      if (transaction.docChanged && onChange && !muted) onChange()
     },
     handleDOMEvents: {
       mousedown: (view, event) => {
@@ -666,12 +695,12 @@ function create(options) {
         view.dispatch(view.state.tr.setNodeMarkup(item.pos, null, { ...item.node.attrs, task: next }))
         return true
       },
-      mouseup: (view, event) => {
+      mouseup: (view) => {
         onSelectionChange()
         // Give the view's own mouseup handling the first word, then make sure
         // the state selection matches what the browser actually selected.
         if (typeof window !== 'undefined' && typeof window.setTimeout === 'function') {
-          window.setTimeout(() => syncFromDom(view, event), 0)
+          window.setTimeout(() => { if (!view.isDestroyed) syncFromDom(view) }, 0)
         }
         return false
       },
@@ -682,12 +711,8 @@ function create(options) {
     },
   })
 
-  /**
-   * The browser owns the drag; the editor state has to follow it. A click with
-   * no caret (Chromium refuses one after a host lost its editable flag) also
-   * gets a text caret here, so the pane never has to guess.
-   */
-  function syncFromDom(view, event) {
+  /** Follow native text ranges without restoring focus or guessing a caret. */
+  function syncFromDom(view) {
     const picked = typeof window !== 'undefined' && window.getSelection ? window.getSelection() : null
     if (!picked || !picked.rangeCount) return
     const anchor = picked.anchorNode
@@ -710,18 +735,12 @@ function create(options) {
       if (firstCell >= 0 && lastCell >= 0 && firstCell !== lastCell) return
       const current = view.state.selection
       if (current.from !== a || current.to !== b || current instanceof CellSelection) {
-        commitSelection(TextSelection.create(view.state.doc, a, b))
+        try {
+          view.dispatch(view.state.tr.setSelection(TextSelection.create(view.state.doc, a, b)))
+        } catch (error) {
+          // A native range can disappear while its mouseup is queued.
+        }
       }
-      return
-    }
-    const hit = typeof view.posAtCoords === 'function'
-      ? view.posAtCoords({ left: event.clientX, top: event.clientY })
-      : null
-    if (!hit || typeof hit.pos !== 'number') return
-    const caret = Math.min(Math.max(hit.pos, 0), size)
-    const current = view.state.selection
-    if (current instanceof CellSelection || current.from !== caret || current.to !== caret) {
-      commitSelection(TextSelection.near(view.state.doc.resolve(caret)))
     }
   }
 

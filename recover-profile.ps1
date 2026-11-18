@@ -11,7 +11,7 @@
 
 param(
   [string]$ProfileDir = (Join-Path $env:USERPROFILE '.dsh\profiles\desktop'),
-  [string]$Plugin = '@local/dsh-doc-pane'
+  [string]$Plugin = 'dsh-doc-pane'
 )
 
 $ErrorActionPreference = 'Stop'
