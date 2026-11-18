@@ -86,6 +86,18 @@ An AI edit is applied to the document and marked for review. If the file changed
 
 The model follows the current session by default. Another available model can be selected in the sidebar. Model and skill lists come from the current DSH session.
 
+## Session context
+
+When a document is opened from a `.md`, `.mdx`, or `.txt` link in chat, the pane binds it to the session that owns the link. Each question or rewrite request reads recent text messages from that centre session and includes them as model background.
+
+- Up to the latest 8 turns are read, with a total limit of 6,000 characters and 1,200 characters per turn.
+- The sidebar's own latest 10 exchanges are also sent to keep the side conversation continuous.
+- If you switch the centre session while the document remains open, the document stays bound to its original session. Open it again from a link in the new session to use the new context.
+- Closing the document, returning to the document list, or opening another document clears the sidebar's own transcript.
+- Context loading is best effort. If DSH does not expose its session query service, or the read fails, questions and rewrites still work without centre-session background.
+
+This context covers recent text messages. Full history, images, attachments, and tool-call results are not guaranteed to be included, and sidebar messages are not written back into the centre conversation.
+
 ## Saving and conflicts
 
 - The pane reads and writes real files on disk.

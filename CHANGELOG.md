@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Documented how sidebar requests use bounded context from the centre DSH session
+  and how the session binding behaves after switching conversations.
+
 ## 0.1.3
 
 Released 2026-11-18.
